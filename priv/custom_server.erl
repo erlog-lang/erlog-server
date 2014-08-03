@@ -1,4 +1,5 @@
 %% THIS module is not compiled directly, but it used to build a custom sever
+%% We build an AST from it and then add stuff to that AST to build the final server
 
 -module(custom_server).
 
@@ -32,12 +33,31 @@ start_link() ->
     gen_server:start_link( ?MODULE, [], []).
 
 init(_) ->
-    {ok,DBState} = db_state(),
-    Erlog        = erlog:new(DBState),
-    {ok,  Erlog}.
+    {ok, DBState}  = db_state(),
+    {ok, Erlog1 }  = erlog:new(),
+    Erlog2         = erlog:set_db(Erlog1, DBState),
+    {ok, Erlog2}.
 
-handle_call(_Request, _From,  Erlog) ->
-    {reply,ok, Erlog}.
+handle_prolog(Request, Erlog, last) ->
+    case erlog:prove(Erlog, Request) of
+	{{succeed, [{'Return', Return}]}, E1} ->
+	    {reply, Return, E1};
+	{fail, E1} ->
+	    {reply, fail, E1}
+    end;
+handle_prolog(Request, Erlog, none) ->
+    case erlog:prove(Erlog,Request) of
+	{{succeed, _}, E1} ->
+	    {reply, true, E1};
+	{fail, E1} ->
+	    {reply, false, E1}
+    end.
+
+handle_call(Request = {add_sib,_A,_B}, _From,  Erlog) ->
+    handle_prolog(Request, Erlog, none);
+handle_call(Request,_, Erlog) ->
+    io:format("Error unknown request ~p~n", [Request]),
+    {reply, error, Erlog}.
 
 handle_cast(_Msg, State) ->
     {noreply, State}.

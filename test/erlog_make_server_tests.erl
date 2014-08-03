@@ -2,7 +2,7 @@
 -include_lib("eqc/include/eqc.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -compile(export_all).
-
+-compile({parse_transform, seqbind}).
 
 pl_arity() ->
     choose(2,4).
@@ -11,41 +11,21 @@ clause_name() ->
     elements(['edge','connected', ancestor, descendent,path, travel]).
 
 ret_val() ->
-    elements(['Path','X','Y','Z',boolean]).
+    oneof([last, none]).
 
 erl_export() ->
     {erl_export, {'/', clause_name(), pl_arity()}, return, ret_val()}.
 
-assert_functions() ->
-    Functions   = po_set:module_info(functions),
 
-    ?assert(lists:member({db_state,0},                   Functions)),
-    ?assert(lists:member({make_supervisor_childspec, 0}, Functions)),
-    ?assert(lists:member({start_link, 0},                Functions)),
-    ?assert(lists:member({init,1} ,                      Functions)),
-    ?assert(lists:member({handle_call, 3},               Functions)),
-    ?assert(lists:member({handle_cast, 2},               Functions)),
-    ?assert(lists:member({handle_info, 2},               Functions)),
-    ?assert(lists:member({path, 3},                      Functions)),
-    
-    true.
-
-prop_compile_file() ->
-    {ok,po_set} = erlog_make_server:compile_file("priv/po_set.pl", po_set),
-    true        = assert_functions(),
-    {ok, Pid}   = po_set:start_link(),
-    ?assert(is_process_alive(Pid)),
-    {ok,Path}   = po_set:path(Pid,a,f),
-    ?assertEqual([a,b,f], Path),
-    true.
 
 prop_find_exported_clauses() ->
     ?FORALL(Clauses, non_empty(list(erl_export())),
 	    begin
-		PL0             = erlog:new(),
-                PL2             = add_export_clauses(Clauses, PL0),
-		{Exports,_PL3}  = erlog_make_server:find_exports(PL2),
-                ?assertEqual(length(Exports),length(Clauses)),
+		{ok, PL@}       = erlog:new(),
+                PL@             = add_export_clauses(Clauses, PL@),
+		{ok,PL@}        = erlog:consult(PL@, "src/erlog_make_server.pl"),
+		{Exports,_}     = erlog_make_server:find_exports(PL@),
+                ?assertEqual(length(Clauses),length(Exports)),
 		?assert(lists:all(fun(_Export = {Fun, Arity}) ->
 					  lists:keymember({'/',Fun, Arity}, 2, Clauses)
 			      end, Exports)),
@@ -56,16 +36,17 @@ prop_find_exported_clauses() ->
 
 add_export_clauses(Clauses, PL0) ->
     lists:foldl(fun(CL,PL) ->
-			{{succeed, _},PL1} = PL({prove,{asserta, CL}}),
+			{{succeed, _},PL1} = erlog:prove(PL,{asserta, CL}),
 			PL1
                 end, PL0, Clauses).
 
 purge(ModName) ->
-                                %% Purge any results of old runs
-                            code:purge(ModName),
-                            code:delete(ModName).
+    %% Purge any results of old runs
+    code:purge(ModName),
+    code:delete(ModName).
 prop_load_base_ast()->
     application:start(erlog),
+    application:start(erlog_server),
     {ok, AST}  = erlog_make_server:load_base_ast(),
     lists:all(fun(F) ->
                       is_tuple(F)
@@ -105,7 +86,6 @@ erlog_files() ->
      "test/po_set.pl"].
 
 prop_replace_file() ->
-    application:start(erlog),
     {ok, AST}  = erlog_make_server:load_base_ast(),
     ?FORALL(PrologFile,
             elements(erlog_files()),
@@ -117,7 +97,7 @@ prop_replace_file() ->
             end).
 
 prop_replace_module_name() ->
-    application:start(erlog),
+    application:start(erlog_server),
     {ok, [ASTHead,_|Rest] = AST}  = erlog_make_server:load_base_ast(),
     ?FORALL(PrologModule,
             elements(erlog_modules()),
@@ -175,10 +155,10 @@ prop_add_prolog_export_clauses() ->
                             ?debugVal(Clauses)
                         end, 
                         begin
-                            PL0             = erlog:new(),
-                            PL2             = add_export_clauses(Clauses, PL0),
-                            {Exports,_PL3}  = erlog_make_server:find_exports(PL2),
-                            {ok, AST1}   = erlog_make_server:add_exports(AST,Exports),
+                            {ok,PL@ }       = erlog:new(),
+                            PL@             = add_export_clauses(Clauses, PL@),
+                            {Exports,_PL3}  = erlog_make_server:find_exports(PL@),
+                            {ok, AST1}   = erlog_make_server:add_exports(AST,Exports,PL@),
                             ?assertEqual(length(AST1), length(AST)),
                             NewExports = exports(AST1),
                             ?assertEqual(NewExports, BaseExports++Exports),
@@ -187,24 +167,35 @@ prop_add_prolog_export_clauses() ->
     
 
 prop_db_state() ->
-    
     application:start(erlog),
-    PL                         = erlog:new(),
-    {ok, PL1}                  = PL({consult, "priv/po_set.pl"}),
-    {ok,  AST}                 = erlog_make_server:load_base_ast(),
-    {ok,  AST1}                = erlog_make_server:load_db_state(AST, PL1),
-    {ok,custom_server, Binary} = compile:forms(AST1,[]),
+    {ok,  PL@}                 = erlog:new(),
+    {ok,  PL@}                 = erlog:consult(PL@, "priv/po_set.pl"),
+
+    {ok,  AST@}                = erlog_make_server:load_base_ast(),
+    {ok,  AST@}                = erlog_make_server:load_db_state(AST, PL@),
+    {ok,custom_server, Binary} = compile:forms(AST@,[]),
     {module, _}                = code:load_binary(custom_server, "custom_server.erl",Binary),
     {ok, _DBState}             = custom_server:db_state(),
-    {ok, E1}                   = custom_server:init([]),
-    case E1({prove, {path, a, f, {'Path'}}}) of
-        {{succeed, [{'Path', _Path}]},_E2} ->
+    {ok, E@}                   = custom_server:init([]),
+    case erlog:prove(E@, {path, a, f, {'Path'}}) of
+        {{succeed, [{'Path', _Path}]},_} ->
             true;
         fail ->
             false
     end.
 
-prop_make_param_list() ->
+prop_record_defs()->
+    {ok,  PL@}		= erlog:new(),
+    {ok,  PL@}		= erlog:consult(PL@, "src/erlog_make_server.pl"),
+    {ok,  PL@}		= erlog:consult(PL@, "priv/po_set.pl"),
+    {ok,  PL@}          = erlog_make_server:record_defs(PL@),
+    {{succeed, _}, PL@} = erlog:prove(PL@, {clause, {est, {'W'}, {'X'}, {'Y'}}, {'Z'}}),
+    {{succeed, _}, _}   = erlog:prove(PL@, {clause, {est, {'A'}, {'W'}, {'X'}, {'Y'}}, {'Z'}}),
+    true.
+
+
+
+rop_make_param_list() ->
     ?FORALL({ParamCount},
             {
              choose(2,10)},
@@ -219,7 +210,6 @@ prop_make_param_list() ->
 
             end).
 
-
 set_node() ->
     elements([a,b,c,d,e,f]).
 edge() ->
@@ -227,37 +217,52 @@ edge() ->
 edges() ->
     non_empty(list(edge())).
 
-%% prop_supervisor_spec() ->
-%%     erlog_make_server_tests_sup:start_link(),
-%%     ModName		= edges_pl,
-%%     {ok,ModName}	= erlog_make_server:compile_file("priv/edges_pl.pl",ModName),
-%%     R			= ModName:make_child_spec(make_ref()),
-%%     ok			= supervisor:check_childspecs([R]),
-%%     {ok,Pid}		= supervisor:start_child(erlog_make_server_tests_sup, R),
-%%     is_process_alive(Pid).
+% prop_supervisor_spec() ->
+%     erlog_make_server_tests_sup:start_link(),
+%     ModName		= po_set,
+%     {ok,ModName}	= erlog_make_server:compile_file("priv/po_set.pl",ModName),
+%     {ok,R}     		= ModName:make_child_spec(make_ref()),
+%     ?debugVal(R),
+%     ok			= supervisor:check_childspecs([R]),
+%     {ok,Pid}		= supervisor:start_child(erlog_make_server_tests_sup, R),
+%     is_process_alive(Pid).
     
     
 
 
-%% prop_run_pl() ->
-%%        ?FORALL({ModName, Edges},
-%% 	    {'edges_pl',edges() },
-%% 	    begin
-%% 		code:purge(ModName),
-%% 		code:delete(ModName),
-%% 		{ok,ModName}	= erlog_make_server:compile_file("priv/edges_pl.pl",ModName),
-%% 		Exports		= ModName:module_info(exports),
 
-%% 		?assert(lists:member({add_edge, 3}, Exports)),
+assert_functions() ->
+    Functions   = po_set:module_info(functions),
+    ?assert(lists:member({db_state,0},                   Functions)),
+    ?assert(lists:member({make_supervisor_childspec, 0}, Functions)),
+    ?assert(lists:member({start_link, 0},                Functions)),
+    ?assert(lists:member({init,1} ,                      Functions)),
+    ?assert(lists:member({handle_call, 3},               Functions)),
+    ?assert(lists:member({handle_cast, 2},               Functions)),
+    ?assert(lists:member({handle_info, 2},               Functions)),
+    ?assert(lists:member({handle_prolog, 3},             Functions)),
+    ?assert(lists:member({path, 3},                      Functions)),
+    ?assert(lists:member({add_edge, 3},                  Functions)),
+    ?assert(lists:member({sib, 3},                       Functions)),
+    true.
 
-%% 		true            = lists:member({make_child_spec, 1}, Exports),
-%% 		{ok,Pid}        = erlog_custom_server:start_link("priv/edges_pl.pl"),
-%% 		true            = is_process_alive(Pid),
-%% 		lists:foreach(fun({edge,S,F}) ->
-%% 				      _R = ModName:add_edge(Pid,S,F),
-				      
-%% 				      true
-%% 			  end, Edges),
-%% 		unlink(Pid),
-%% 		is_process_alive(Pid)
-%% 	    end).
+prop_compile_file() ->
+    {ok,po_set,_} = erlog_make_server:compile_file("priv/po_set.pl", po_set),
+    true          = assert_functions(),
+    {ok, Pid}     = po_set:start_link(),
+    ?assert(is_process_alive(Pid)),
+    true.
+
+prop_execute_code() ->
+    {ok,po_set,_} = erlog_make_server:compile_file("priv/po_set.pl", po_set),
+    {ok, Pid}     = po_set:start_link(),
+    ?assert(is_process_alive(Pid)),
+    Path          = po_set:path(Pid,a,f),
+    ?assertEqual([a,b,f], Path),
+    ?assertNot(po_set:sib(Pid,a,b)),
+    ?assert(po_set:sib(Pid,c,b)),
+    ?assert(po_set:add_edge(Pid,f,z)),
+    Path2   = po_set:path(Pid,a,z),
+    ?assertEqual([a,b,f,z], Path2),
+    true.
+

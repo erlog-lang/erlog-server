@@ -1,70 +1,85 @@
--module(erlog_make_server).
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+ -module(erlog_make_server).
+ %% Licensed under the Apache License, Version 2.0 (the "License");
+ %% you may not use this file except in compliance with the License.
+ %% You may obtain a copy of the License at
+ %%
+ %%     http://www.apache.org/licenses/LICENSE-2.0
+ %%
+ %% Unless required by applicable law or agreed to in writing, software
+ %% distributed under the License is distributed on an "AS IS" BASIS,
+ %% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ %% See the License for the specific language governing permissions and
+ %% limitations under the License.
 
-%% File    : erlog_make_server.erl
-%% Author  : Zachary Kessin
-%% Purpose : Convert an erlog .pl file to an erlang gen_server
+ %% File    : erlog_make_server.erl
+ %% Author  : Zachary Kessin
+ %% Purpose : Convert an erlog .pl file to an erlang gen_server
 
-%% To export clauses use erl_export(clause/N) 
-%% The prolog clause <<X>>/N will become the erlang function <<X>>/N, with the first 
-%% Element of the erlang function being the pid of the gen server, and the last element 
-%% of the prolog clause being the return value
-%%TODO redo from core erlang to an AST setup
+
 
 
 
 -compile(export_all).
 -compile({parse_transform, seqbind}).
 -include_lib("eunit/include/eunit.hrl").
+-export([erlog/2, compile_file/2]).
 -ifdef(TEST).
-
 -compile(export_all).
 -endif.
 
+erlog(_Config, _AppFile) ->
+    ErlogDir = filename:join([rebar_utils:get_cwd(), "erlog"]),
+    compile_files(filelib:is_dir(ErlogDir), ErlogDir).
+    
 
-%% -spec(compile_buffer(atom(), iolist()) ->
-%% 	     {ok, atom()}).
+compile_files(false,_) ->
+    {ok,[]};
+compile_files(true, Directory) ->
+    Files = filelib:wildcard(Directory ++"/*.pl"),
+    ModuleNames = lists:map(fun(File) ->
+				    {ok, _Module, Binary}	= compile_file(File, make_module_name(File)),
+				    BeamFile			= filename:join([rebar_utils:get_cwd(),"ebin", atom_to_list(make_module_name(File)) ++ ".beam"]),
+				    ok			= file:write_file(BeamFile, Binary),
+				    make_module_name(File)
+			    end, Files),
+    {ok,ModuleNames}.
+
+make_module_name(File) -> list_to_atom(filename:basename(File, ".pl")).
 
 
-%    file:write_file("test1.ast", io_lib:format("% -*-Erlang -*- ~n~n~p~n",[AST@])),
-%   file:write_file("test2.ast", io_lib:format("% -*-Erlang -*- ~n~n~p~n",[AST@])),
+ %% -spec(compile_buffer(atom(), iolist()) ->
+ %% 	     {ok, atom()}).
+
+
+
 
 compile_file(File,Module) when is_atom(Module)->
-    PL@                   = erlog:new(),
-    {ok,PL@}             = PL@({consult, File}),
+    {ok, PL@}            = erlog:new(),
+    {ok, PL@}            = erlog:consult(PL@,File),
+    {ok, PL@}	         = erlog:consult(PL@, "src/erlog_make_server.pl"),
+    {ok, PL@}            = record_defs(PL@),
     {Exports,PL@}        = find_exports(PL@),
-    ?debugVal(Exports),
     {ok, AST@}           = load_base_ast(),
     {ok, AST@}           = replace_filename(AST@, File),
     {ok, AST@}           = replace_module_name(AST@, Module),
     {ok, AST@}           = replace_start_link(AST@, Module),
     {ok, AST@}           = load_db_state(AST@, PL@),
-    {ok, AST@}           = make_interface_functions(AST@, Exports),
-    {ok, AST@}           = add_exports(AST@, Exports),
-    {ok, AST@}           = make_handler_clauses(AST@,Exports),
-    case compile:forms(AST@, [from_ast,debug_info,return]) of
-        {ok, Module, Binary,Errors} ->
-            file:write_file("errors", io_lib:format("% -*- Erlang -*- ~n~n~p~n",[Errors])),
-            {module, Module}     = code:load_binary(Module, File, Binary),
-            {ok, Module};
-        E ->
-            E
-    end.
+    {ok, AST@}           = make_interface_functions(AST@, Exports, PL@),
+    {ok, AST@}           = add_exports(AST@, Exports, PL@),
+    {ok, AST@}           = make_handler_clauses(AST@,Exports,PL@),
+    case compile:forms(AST@, [from_ast, debug_info, return]) of
+	 {ok, Module, Binary,Errors} ->
+	     file:write_file("errors", io_lib:format("% -*- Erlang -*- ~n~n~p~n",[Errors])),
+	     {module, Module}     = code:load_binary(Module, File, Binary),
+	     {ok, Module, Binary};
+	 E ->
+	     E
+     end.
 
 
--spec(load_base_ast() -> {ok, term()}).
-load_base_ast()->
-    FileName   = code:priv_dir(erlog) ++ "/custom_server.erl",
+ -spec(load_base_ast() -> {ok, term()}).
+ load_base_ast()->
+    FileName   = "priv/custom_server.erl",
     {ok, AST}  = epp:parse_file(FileName,[],[]),
     {ok, AST}.
 
@@ -91,11 +106,23 @@ print_exports(AST) ->
                               (_)  -> false
                            end, AST),
     Exports.
-        
-add_exports(AST,PLExports) ->  
+
+update_exports(Exports, PL) ->
+    lists:map(fun({Pr, Ar}) ->
+		      case get_return_value({'/', Pr, Ar},PL) of
+			  none ->
+			       {Pr, Ar + 1};
+			  last ->
+			      {Pr, Ar }
+		      end
+	      end, Exports).
+
+add_exports(AST, PLExports, PL) ->  
     print_exports(AST),
+    Exports = update_exports(PLExports,PL),
+
     AST1 = lists:map(fun({attribute,Line,export,[]}) ->
-                                   {attribute,Line,export,PLExports};
+                                   {attribute,Line,export,Exports};
                               (X) -> X
                            end,AST),
     print_exports(AST1),
@@ -124,37 +151,64 @@ make_supervisor_childspec(AST,PLModule) ->
 
 find_exports(PL) ->
     PL@ = PL,
-    {ok, PL@}	= PL@({consult, "src/erlog_make_server.pl"}),
-    case PL@({prove, {find_exports, {'Exports'}}}) of 
+    case erlog:prove(PL@, {find_exports, {'Exports'}}) of 
 	{{succeed, Res},PL@} ->
 	    Exports = [{Fun, Arity } || {'/', Fun,Arity} <- proplists:get_value('Exports', Res)],
 	    
 	    {Exports,PL@};
-	fail ->
+	{fail,PL@} ->
 	   {[], PL@}
     end.
 
+field_names(Fields) ->
+    [FieldName || {record_field, _, {atom, _, FieldName}} <- Fields].
+
+get_records(AST) ->
+    AST@ = lists:filter(fun({attribute, _, record, _}) ->
+				true;
+			   (_) -> false
+			end, AST),
+    AST@ = lists:map(fun({attribute, _, record, {RecordName, Fields}}) ->
+			     {record, RecordName, field_names(Fields)}
+		     end, AST@),
+
+    {ok, AST@}.
+
+record_defs(PL) ->
+    {ok,PL@}                            = erlog:consult(PL, "priv/records.pl"),
+    {{succeed, [{import, Files}]}, PL@}	= erlog:prove(PL@, {find_imports,{import}}),
+    PL@ = lists:foldl(fun(File, PL) ->
+			      Erlog@ = PL,
+			      {ok, AST}  = epp:parse_file(File,[],[]), 
+			      {ok,Records} = get_records(AST),
+			      {{succeed,_}, Erlog@} = erlog:prove(Erlog@,{records, Records}),
+			      Erlog@
+		      end, PL@, Files),
+    {ok,PL@}.
 
 load_db_state(AST, E0) ->
-    {{ok,DB},_E2} = E0(get_db),
+    DB             = erlog:get_db(E0),
     AbstractDB    = abstract(DB),
     AST1          = lists:keyreplace(db_state, 3, AST, 
                              {function,26,db_state,0,
                               [{clause,26,[],[],[{tuple,27,[{atom,27,ok},AbstractDB]}]}]}),
     {ok, AST1}. 
 
-make_handler_clauses(AST, Exports) ->
-    NewClauses = [base_fn_clause(Predicate,Arity) ||{Predicate, Arity} <- Exports],
-    AST1       = lists:keyreplace(handle_call,3, AST,
-                                  {function, 39, handle_call, 3,
-                                   NewClauses}),
-    {ok,AST1}.
 
 
-make_interface_function({Function, Arity}) when is_atom(Function) and is_integer(Arity)->
+make_interface_function({Function, Arity},PL) when is_atom(Function) and is_integer(Arity)->
     Line = 31,
-    Params = make_param_list(Arity - 1, Line),
-    {function,Line,Function, Arity ,
+    RetVal = get_return_value({'/',Function,Arity},PL),
+
+    Params = case RetVal of 
+		 last -> make_param_list(Arity -1, Line);
+		 none -> make_param_list(Arity , Line)
+	     end,
+    EfArity = case RetVal of 
+		  last -> Arity;
+		  none -> Arity + 1
+	      end,
+    FN = {function,Line,Function, EfArity ,
      [{clause,Line,
        [{var,Line,'Pid'}|Params],
        [],
@@ -162,11 +216,11 @@ make_interface_function({Function, Arity}) when is_atom(Function) and is_integer
          {remote,Line,{atom,30,gen_server},{atom,30,call}},
          [{var,Line,'Pid'},
           {tuple,Line,
-           [{atom,Line,prove},
-            {tuple, Line,
              [{atom, Line, Function}| Params]
-            }]
-          }]}]}]}.
+          }
+	 ]}]}]},
+    FN.
+
 
 insert_interface_inner([],_, Acc) ->
     {ok,Acc};
@@ -181,61 +235,55 @@ insert_interface_inner([F|Rest], E, Acc) ->
 insert_interface(AST, Exports) ->
     insert_interface_inner(AST,Exports,[]).
 
-make_interface_functions(AST, Exports) ->
-    InterfaceFns = [make_interface_function(Fn)|| Fn <-Exports],
+
+make_interface_functions(AST, Exports, PL) ->
+    InterfaceFns = [make_interface_function(Fn,PL)|| Fn <-Exports],    
     insert_interface(AST, InterfaceFns).
 
+
+make_handler_clauses(AST, Exports,PL) ->
+    NewClauses = [base_fn_clause(Predicate, Arity, PL) ||{Predicate, Arity} <- Exports],
+    AST1       = lists:keyreplace(handle_call,3, AST,
+                                  {function, 39, handle_call, 3,
+                                   NewClauses}),
+    {ok,AST1}.
 
 
 make_param_list(ParamCount,Line) when is_integer(ParamCount)->   
     PList     = lists:seq(65,65 + ParamCount -1),
-    PAtomList = [list_to_atom([P]) ||P <-PList],
+    PAtomList = [list_to_atom([$_,P]) ||P <-PList],
     [{var, Line, PAtom}|| PAtom <- PAtomList].
 
-base_fn_clause(Predicate, ParamCount ) when is_atom(Predicate) andalso is_integer(ParamCount) ->
-    ParamList = [{atom,46,Predicate}] ++ make_param_list( ParamCount - 1,46),
-    {clause,46,
-     [{match,46,
-       {var,46,'_Prove'},
-       {tuple,46,
-        [{atom,46,prove},
-         {tuple,46,
-          ParamList
-         }]}},
-      {var,46,'_From'},
-      {var,46,'Erlog'}],
+
+get_return_value(Function, PL) ->
+    {{succeed, [{'RetVal', RetVal}]},_}= erlog:prove(PL, {find_return, Function, {'RetVal'}}),
+    RetVal.
+
+     
+base_fn_clause(Predicate, ParamCount,PL ) when is_atom(Predicate) andalso is_integer(ParamCount) ->
+    RetVal = get_return_value({'/',Predicate,ParamCount},PL),
+    
+    IParamList = [{atom,46,Predicate}] ++ case RetVal of 
+					     none -> make_param_list(ParamCount,46);
+					     last -> make_param_list(ParamCount -1, 46)
+					 end,
+    ParamList =   case RetVal of 
+		      none -> IParamList;
+		      last -> IParamList ++ [{tuple, 55, [{atom, 55,'Return'}]}]
+		  end,
+    {clause,54,
+     [{match,54,
+       {var,54,'_Request'},
+       {tuple,54,
+	IParamList
+       }},
+      {var,54,'_From'},
+      {var,54,'Erlog'}],
      [],
-         [{'case',47,
-           {call,47,
-            {var,47,'Erlog'},
-            [{tuple,47,
-              [{atom,47,prove},
-               {tuple,47,
-                ParamList ++ [{tuple,47,[{atom,47,'X'}]
-                              }]}]}]},
-           [{clause,48,
-             [{tuple,48,
-               [{tuple,48,
-                 [{atom,48,succeed},
-                  {cons,48,
-                   {tuple,48,
-                    [{atom,48,'X'},{var,48,'RetVal'}]},
-                   {nil,48}}]},
-                {var,48,'Erlog1'}]}],
-             [],
-             [{tuple,49,
-               [{atom,49,reply},
-                {tuple,49,[{atom,49,'ok'},
-                           {var,49,'RetVal'}]},
-                {var,49,'Erlog1'}]}]},
-            {clause,50,
-             [{atom,50,fail}],
-             [],
-             [{tuple,51,
-               [{atom,51,reply},
-                {atom,51,fail},
-                {var,51,'Erlog'}]
-              }]}]}]}.
+     [{call,55,
+       {atom,55,handle_prolog},
+       [{tuple,55,ParamList},{var,55,'Erlog'},{atom,55,RetVal}]}
+     ]}.
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
